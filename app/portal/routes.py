@@ -31,7 +31,7 @@ from app.data.ingest import IngestError, ingest_xlsx
 from app.data.models import Case, Invoice, PromiseToPay, ReliabilityScore
 from app.db import get_session
 from app.decisions.decision_layer import LEVEL_NAMES
-from app.integrations import razorpay_client, twilio_client
+from app.integrations import calle_client, razorpay_client, twilio_client
 from app.integrations.razorpay_client import is_oversized_stub
 from app.playbooks.loader import get_registry
 from app.reports.batch_report import build_report
@@ -463,6 +463,7 @@ def settings_page(request: Request, session: Session = Depends(get_session)):
             "auto_dispatch_paused": get_settings(session).auto_dispatch_paused,
             "razorpay_configured": razorpay_client.is_configured(),
             "twilio_configured": twilio_client.is_configured(),
+            "calle_configured": calle_client.is_configured(),
             "sendgrid_configured": bool(os.getenv("SENDGRID_API_KEY")),
             "anthropic_configured": chatbot_agent.is_configured(),
             "test_email_override": os.getenv("TEST_EMAIL_OVERRIDE") or None,

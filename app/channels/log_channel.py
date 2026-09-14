@@ -10,7 +10,7 @@ logger = logging.getLogger("recovery.channels.log")
 class LogChannel(Channel):
     """Dev/demo channel — every other channel falls back to this when its
     credentials aren't configured (NFR-7), so the full engine is runnable
-    end-to-end without any live Twilio/SendGrid account."""
+    end-to-end without any live CALL-E/Twilio/SendGrid account."""
 
     name = "log"
 

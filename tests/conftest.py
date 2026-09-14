@@ -19,6 +19,7 @@ def _no_external_credentials(monkeypatch):
     account get rate-limited by earlier test runs before this fixture existed.)"""
     for var in (
         "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
+        "CALLE_API_KEY",
         "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET",
         "SENDGRID_API_KEY", "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD",
     ):

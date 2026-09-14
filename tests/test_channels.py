@@ -11,20 +11,17 @@ def test_log_channel_always_logged():
 
 
 def test_voice_falls_back_to_log_without_credentials(monkeypatch):
-    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
-    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CALLE_API_KEY", raising=False)
     monkeypatch.delenv("TEST_VOICE_OVERRIDE", raising=False)
     result = VoiceChannel().send(to="+911234567890", cc=None, subject="s", body="hello")
     assert result.status == "logged"
 
 
 def test_voice_test_override_redirects_the_call(monkeypatch):
-    # A trial Twilio account can only call verified numbers — every
-    # synthetic customer phone in the demo sheet is unverified and gets
-    # rejected. TEST_VOICE_OVERRIDE mirrors TEST_EMAIL_OVERRIDE: redirect
+    # Every synthetic customer phone in the demo sheet is fake and
+    # unreachable. TEST_VOICE_OVERRIDE mirrors TEST_EMAIL_OVERRIDE: redirect
     # the destination, keep the script itself real.
-    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
-    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CALLE_API_KEY", raising=False)
     monkeypatch.setenv("TEST_VOICE_OVERRIDE", "+911111111111")
 
     captured = {}
@@ -42,12 +39,46 @@ def test_voice_test_override_redirects_the_call(monkeypatch):
 
 
 def test_voice_without_override_calls_the_real_number(monkeypatch):
-    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
-    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CALLE_API_KEY", raising=False)
     monkeypatch.delenv("TEST_VOICE_OVERRIDE", raising=False)
 
     result = VoiceChannel().send(to="+919876500001", cc=None, subject="s", body="hello")
     assert "+919876500001" in result.detail
+
+
+def test_calle_path_places_a_call_and_returns_the_structured_result(monkeypatch):
+    # Regression test mirroring test_sendgrid_path_builds_a_serializable_message:
+    # exercises the real request-construction code path (task text, recipient
+    # dict, result_schema), not just the LogChannel fallback every other voice
+    # test above hits under the credential-stripping autouse fixture.
+    monkeypatch.setenv("CALLE_API_KEY", "calle_test_key")
+    monkeypatch.delenv("TEST_VOICE_OVERRIDE", raising=False)
+
+    captured = {}
+
+    class FakeCalls:
+        def create_and_wait(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "completed",
+                "task_completed": True,
+                "structured_result": {"payment_commitment": "promised_date", "promised_date": "2026-09-20"},
+            }
+
+    class FakeClient:
+        calls = FakeCalls()
+
+    import app.channels.voice as voice_module
+
+    monkeypatch.setattr(voice_module.calle_client, "get_client", lambda: FakeClient())
+
+    result = VoiceChannel().send(to="+919876500001", cc=None, subject="s", body="Aapka invoice overdue hai")
+
+    assert result.status == "sent"
+    assert "promised_date" in result.detail
+    assert captured["recipient"] == {"phone": "+919876500001", "region": "IN", "locale": "hi-IN"}
+    assert "Aapka invoice overdue hai" in captured["task"]
+    assert captured["result_schema"]["required"] == ["payment_commitment"]
 
 
 def test_email_falls_back_to_log_without_credentials(monkeypatch):

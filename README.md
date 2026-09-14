@@ -23,8 +23,23 @@ computes a number or makes a business decision itself.
   to (SPOC → manager → skip-level) and how long to wait before checking
   again.
 - **Escalates** by real email through that internal chain, and — only once
-  it's fully exhausted and still unpaid — places a real scripted Hinglish
-  voice call to the customer directly, via Twilio.
+  it's fully exhausted and still unpaid — places a real goal-driven voice
+  call to the customer directly, via [CALL-E](https://heycall-e.com): it
+  holds an actual Hinglish conversation rather than reading a fixed script,
+  and returns whether the customer will pay and by when.
+- **Closes the loop on that call within seconds, not the next batch run** —
+  the moment CALL-E's structured result comes back. It's a real negotiation,
+  not a yes/no script, so it handles: paying in full now (link delivered to
+  whichever of WhatsApp/email the customer actually asked for); paying part
+  now with a date for the rest (a second link scoped to that exact amount,
+  clamped to what's really owed); a committed future date (a real
+  promise-to-pay, tracked exactly like one logged through the WhatsApp bot);
+  a refusal or "already paid" (paused for human review immediately, not at
+  the next exhaustion check); asking for a human instead of the agent
+  (every open case for that customer paused right away); or genuinely
+  needing a callback at a specific time (paused with that time on record,
+  since the terminal voice rung isn't built to place a second automatic
+  call — a human decides when to actually place it).
 - **Answers questions** on WhatsApp (inbound-only): weekly payment
   schedules, collection follow-ups, logging a promise-to-pay, flagging a
   dispute — for anyone on the team who texts the Sandbox number.
@@ -39,8 +54,8 @@ computes a number or makes a business decision itself.
   — nothing escalates forever, and every paused/exhausted case lands in a
   dedicated **Needs Review** queue for a human.
 - **Never blocks on missing credentials** — every external integration
-  (Razorpay, Twilio, SendGrid) degrades to a safe local stub/log fallback,
-  so the whole loop runs end-to-end with zero live accounts.
+  (Razorpay, CALL-E, Twilio, SendGrid) degrades to a safe local stub/log
+  fallback, so the whole loop runs end-to-end with zero live accounts.
 
 ## Try it in five minutes
 
@@ -63,12 +78,12 @@ decide → escalate → close loop still runs exactly as it would live.
 - `python scripts\smoke_test.py` runs the whole loop non-interactively
   (ingest → several batch passes → simulated payments → report) and prints a
   summary — safe to run any time, it strips real credentials first.
-- `pytest` — 343 tests, all passing.
+- `pytest` — 356 tests, all passing.
 
-Wiring up real Razorpay/Twilio/SendGrid credentials (to see a real WhatsApp
-reply, a real escalation email, or a real payment close a case) — every var
-that unlocks is documented inline in `.env.example`; nothing there is
-required to run the app.
+Wiring up real Razorpay/CALL-E/Twilio/SendGrid credentials (to see a real
+WhatsApp reply, a real escalation email, a real voice call, or a real
+payment close a case) — every var that unlocks is documented inline in
+`.env.example`; nothing there is required to run the app.
 
 ## Portal
 
@@ -100,7 +115,7 @@ app/
   channels/                     email · voice · log, one interface
   scoring/, reports/            reliability scoring, weekly reports, cash-flow forecast
   chatbot/                      Claude tool-calling + the write-action confirmation gate
-  integrations/                 Razorpay, Twilio
+  integrations/                 Razorpay, CALL-E, Twilio
   webhooks/                     Razorpay payment webhook, WhatsApp inbound webhook
   portal/                       FastAPI routes + Jinja2/Tailwind templates
 ```
@@ -108,7 +123,7 @@ app/
 ## Tech stack
 
 FastAPI · SQLAlchemy 2.0 · SQLite · Jinja2 + Tailwind · pytest · Razorpay ·
-Twilio (WhatsApp Sandbox + Voice) · SendGrid · Anthropic Claude
+CALL-E (voice) · Twilio (WhatsApp Sandbox) · SendGrid · Anthropic Claude
 (`claude-sonnet-5`, chatbot routing only).
 
 ## What's deliberately not here

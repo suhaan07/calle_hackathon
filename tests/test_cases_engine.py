@@ -21,6 +21,7 @@ from app.cases.engine import (
     sync_cases,
 )
 from app.data.models import Case, PromiseToPay, Settings
+from app.reports.format_utils import IST
 
 # 10:00 UTC = 15:30 IST — comfortably outside the default 21:00-09:00 IST
 # quiet-hours window, so these tests don't flake depending on what time of
@@ -327,7 +328,7 @@ def test_send_voice_call_test_does_not_advance_the_case(session, make_customer, 
     result = send_voice_call_test(session, case, today=dt.date.today())
     assert result["to"] == "+919876512346"
     assert result["dialed"] is None  # no override configured
-    assert result["status"] in ("logged", "sent")  # "logged" since no real Twilio creds in tests
+    assert result["status"] in ("logged", "sent")  # "logged" since no real CALL-E creds in tests
 
     session.refresh(case)
     assert case.playbook_name is None  # a test call is not a real escalation touch
@@ -383,6 +384,207 @@ def test_set_case_level_then_send_now_advances_to_voice(session, make_invoice):
     assert outcome == "dispatched"
     session.refresh(case)
     assert case.level_index == 3  # voice
+
+
+def _dispatch_case_at_voice_with_structured_result(session, make_invoice, invoice_no, structured, monkeypatch, customer=None):
+    """Shared setup for the CALL-E closed-loop tests below: land a case on
+    voice via the same set_case_level("skip_level") + force_dispatch_case
+    mechanism as test_set_case_level_then_send_now_advances_to_voice, but
+    with the voice channel faked to return a specific structured
+    payment_commitment instead of hitting real (unconfigured) CALL-E."""
+    import app.cases.engine as engine_module
+    from app.channels.base import ChannelResult
+    from app.channels.registry import get_channel as real_get_channel
+
+    invoice = make_invoice(customer=customer, outstanding=10_000.0, due_date=dt.date.today() - dt.timedelta(days=5), invoice_no=invoice_no)
+    sync_cases(session)
+    case = session.query(Case).filter(Case.invoice_id == invoice.id).one()
+    set_case_level(session, case, "skip_level")
+
+    class FakeVoiceChannel:
+        name = "voice"
+
+        def send(self, **kwargs):
+            return ChannelResult(status="sent", detail="ok", structured=structured)
+
+    def fake_get_channel(name):
+        # Only the voice call itself is faked (real CALL-E isn't configured
+        # in tests) — email stays real so the preferred_channel="email" test
+        # below exercises the actual EmailChannel (which safely falls back
+        # to LogChannel with no SendGrid/SMTP creds configured).
+        return FakeVoiceChannel() if name == "voice" else real_get_channel(name)
+
+    monkeypatch.setattr(engine_module, "get_channel", fake_get_channel)
+
+    outcome = force_dispatch_case(session, case, now=FIXED_NOW)
+    assert outcome == "dispatched"
+    session.refresh(case)
+    assert case.level_index == 3  # voice
+    return case
+
+
+def test_voice_paid_now_sends_the_real_payment_link_over_whatsapp(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Paid Now Co", phone="+919876500010")
+    captured = {}
+    monkeypatch.setattr("app.notifications.send_payment_link_to_customer", lambda **kwargs: captured.update(kwargs))
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "PAIDNOW-1", {"payment_commitment": "paid_now"}, monkeypatch, customer=customer,
+    )
+
+    assert captured["customer_phone"] == "+919876500010"
+    assert captured["pay_link_url"]  # a (stub, in tests) link was minted and passed through
+    assert any((e.payload or {}).get("reason") == "voice_paid_now" for e in case.events)
+
+
+def test_voice_promised_date_records_a_real_promise_to_pay(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Promise On Call Co", phone="+919876500011")
+    promised = (dt.date.today() + dt.timedelta(days=5)).isoformat()
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "VOICEPROMISE-1",
+        {"payment_commitment": "promised_date", "promised_date": promised, "notes": "will pay Friday"},
+        monkeypatch, customer=customer,
+    )
+
+    promise = session.query(PromiseToPay).filter(PromiseToPay.customer_id == customer.id).one()
+    assert promise.source == "voice"
+    assert promise.status == "pending"
+    assert promise.promised_date.isoformat() == promised
+    assert promise.raw_text == "will pay Friday"
+    assert case  # the case itself is untouched beyond the normal dispatch fields
+
+
+def test_voice_promised_date_that_is_unparseable_is_skipped_not_crashed(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Bad Date Co", phone="+919876500012")
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "VOICEPROMISE-2",
+        {"payment_commitment": "promised_date", "promised_date": "not-a-date"},
+        monkeypatch, customer=customer,
+    )
+
+    assert session.query(PromiseToPay).filter(PromiseToPay.customer_id == customer.id).count() == 0
+    assert any((e.payload or {}).get("reason") == "voice_promised_date_unparseable" for e in case.events)
+
+
+def test_voice_refused_pauses_the_account_for_human_review(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Refused On Call Co", phone="+919876500013")
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "VOICEREFUSED-1",
+        {"payment_commitment": "refused", "notes": "says this invoice was already paid"},
+        monkeypatch, customer=customer,
+    )
+
+    session.refresh(case)
+    assert case.status == "paused"
+    assert any((e.payload or {}).get("reason") == "disputed" for e in case.events)
+
+
+def test_voice_paid_now_prefers_email_when_the_customer_asks_for_it(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Email Please Co", email="prefers-email@example.com", phone="+919876500014")
+    whatsapp_captured = {}
+    monkeypatch.setattr("app.notifications.send_payment_link_to_customer", lambda **kwargs: whatsapp_captured.update(kwargs))
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "PAIDNOW-EMAIL-1",
+        {"payment_commitment": "paid_now", "preferred_channel": "email"},
+        monkeypatch, customer=customer,
+    )
+
+    assert whatsapp_captured == {}  # WhatsApp never touched — email was explicitly preferred and customer.email exists
+    assert any((e.payload or {}).get("reason") == "voice_paid_now" and e.payload.get("sent_link_via") == "email" for e in case.events)
+
+
+def test_voice_partial_payment_clamps_to_the_outstanding_balance_and_sends_a_link(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Partial Payer Co", phone="+919876500015")
+    whatsapp_captured = {}
+    monkeypatch.setattr("app.notifications.send_payment_link_to_customer", lambda **kwargs: whatsapp_captured.update(kwargs))
+    promised = (dt.date.today() + dt.timedelta(days=7)).isoformat()
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "PARTIAL-1",
+        {"payment_commitment": "partial", "partial_amount_rupees": 999_999, "promised_date": promised, "notes": "rest by next week"},
+        monkeypatch, customer=customer,
+    )
+
+    # invoice outstanding is 10_000.0 (the shared helper's fixed amount) — a
+    # wildly over-stated partial figure must clamp to that, never exceed it.
+    assert whatsapp_captured["amount_rupees"] == 10_000.0
+    assert any((e.payload or {}).get("reason") == "voice_partial_payment" and e.payload.get("partial_amount") == 10_000.0 for e in case.events)
+
+    promise = session.query(PromiseToPay).filter(PromiseToPay.customer_id == customer.id).one()
+    assert promise.source == "voice"
+    assert promise.promised_date.isoformat() == promised
+
+
+def test_voice_partial_payment_with_invalid_amount_is_skipped_not_crashed(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Bad Partial Co", phone="+919876500016")
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "PARTIAL-2",
+        {"payment_commitment": "partial", "partial_amount_rupees": "a lot"},
+        monkeypatch, customer=customer,
+    )
+
+    assert any((e.payload or {}).get("reason") == "voice_partial_amount_invalid" for e in case.events)
+
+
+def test_voice_callback_request_pauses_for_a_human_to_place_it(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Call Me Back Co", phone="+919876500017")
+    callback_at = (dt.datetime.now(IST) + dt.timedelta(days=1)).replace(microsecond=0).isoformat()
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "CALLBACK-1",
+        {"payment_commitment": "unknown", "callback_requested_at": callback_at, "notes": "in a meeting, call back tomorrow evening"},
+        monkeypatch, customer=customer,
+    )
+
+    session.refresh(case)
+    assert case.status == "paused"
+    assert case.next_action_at is None  # a human decides when to actually place the callback, not the scheduler
+    event = next(e for e in case.events if (e.payload or {}).get("reason") == "callback_requested")
+    assert event.payload["detail"] == "in a meeting, call back tomorrow evening"
+
+
+def test_voice_callback_request_in_the_past_is_ignored(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Stale Callback Co", phone="+919876500018")
+    stale = (dt.datetime.now(IST) - dt.timedelta(days=1)).isoformat()
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "CALLBACK-2",
+        {"payment_commitment": "unknown", "callback_requested_at": stale},
+        monkeypatch, customer=customer,
+    )
+
+    session.refresh(case)
+    assert case.status == "open"  # not paused — a stale/garbage callback time is just ignored
+    assert not any((e.payload or {}).get("reason") == "callback_requested" for e in case.events)
+
+
+def test_voice_escalate_to_human_pauses_every_open_case_and_skips_other_actions(session, make_customer, make_invoice, monkeypatch):
+    customer = make_customer(name="Talk To A Human Co", phone="+919876500019")
+    other_invoice = make_invoice(customer=customer, outstanding=5_000.0, due_date=dt.date.today() - dt.timedelta(days=3), invoice_no="OTHERINV-1")
+    sync_cases(session)
+    other_case = session.query(Case).filter(Case.invoice_id == other_invoice.id).one()
+
+    whatsapp_captured = {}
+    monkeypatch.setattr("app.notifications.send_payment_link_to_customer", lambda **kwargs: whatsapp_captured.update(kwargs))
+
+    case = _dispatch_case_at_voice_with_structured_result(
+        session, make_invoice, "ESCALATE-1",
+        # even a payment_commitment present alongside it must be ignored — escalation wins outright
+        {"payment_commitment": "paid_now", "escalate_to_human": True, "notes": "wants to speak to their account manager"},
+        monkeypatch, customer=customer,
+    )
+
+    assert whatsapp_captured == {}  # paid_now's payment-link automation never ran
+    session.refresh(case)
+    session.refresh(other_case)
+    assert case.status == "paused"
+    assert other_case.status == "paused"  # every open case for this customer, not just the one that was on the call
+    assert any((e.payload or {}).get("reason") == "escalate_to_human" for e in case.events)
 
 
 def test_set_case_level_to_voice_then_send_now_marks_exhausted(session, make_invoice):

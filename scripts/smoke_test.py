@@ -41,7 +41,8 @@ def main() -> None:
     # so stripping here — after import, before any dispatch — is what
     # actually takes effect.
     for var in (
-        "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_VOICE_FROM",
+        "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
+        "CALLE_API_KEY",
         "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET",
         "SENDGRID_API_KEY", "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD",
     ):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import secrets
 
 from sqlalchemy.orm import Session
 
@@ -30,7 +31,7 @@ from app.decisions.decision_layer import LEVEL_NAMES, decide
 from app.integrations.razorpay_client import create_payment_link, is_oversized_stub
 from app.playbooks.loader import get_playbook
 from app.playbooks.renderer import render
-from app.reports.format_utils import format_date, format_inr
+from app.reports.format_utils import IST, format_date, format_inr
 from app.scoring.reliability import compute_score
 
 TERMINAL_STATUSES = {"closed", "exhausted"}
@@ -359,6 +360,184 @@ def _dispatch_level(session: Session, case: Case, playbook: dict, level: dict, c
     case.last_action_at = now
     case.next_action_at = now + dt.timedelta(days=wait_days)
     case.touch_count += 1
+
+    if level["channel"] == "voice":
+        _handle_voice_outcome(session, case, customer, result.structured)
+
+
+def _parse_voice_promised_date(raw: str | None, today: dt.date | None = None) -> dt.date | None:
+    """Same bounds as the portal's manual "log a promise" endpoint — refuse
+    a past date or one implausibly far out rather than trusting whatever
+    CALL-E's extraction model produced verbatim."""
+    if not raw:
+        return None
+    today = today or dt.date.today()
+    try:
+        promised_date = dt.date.fromisoformat(raw)
+    except ValueError:
+        return None
+    if promised_date < today or (promised_date - today).days > 365:
+        return None
+    return promised_date
+
+
+def _parse_voice_callback_at(raw: str | None, now: dt.datetime | None = None) -> dt.datetime | None:
+    """CALL-E is asked for an ISO 8601 datetime with an explicit offset; a
+    bare one (no offset) is treated as IST, since every call this app
+    places is to an Indian customer. Converted to naive UTC to match every
+    other stored timestamp (dt.datetime.utcnow()). Refuses a past time or
+    one more than 30 days out rather than trusting the extraction
+    verbatim."""
+    if not raw:
+        return None
+    now = now or dt.datetime.utcnow()
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=IST)
+    utc_naive = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    if utc_naive <= now or (utc_naive - now).days > 30:
+        return None
+    return utc_naive
+
+
+def _send_payment_link_after_call(
+    customer: Customer, invoice_no: str, amount_rupees: float, pay_link_url: str | None, preferred_channel: str | None,
+) -> str | None:
+    """Delivers a payment link wherever the customer said was easiest on
+    the call, falling back to whichever contact detail is actually on file
+    when they weren't asked or didn't say. Returns which channel was
+    actually used (for the audit-trail event), or None if neither worked."""
+    from app.notifications import send_payment_link_to_customer
+
+    if not pay_link_url:
+        return None
+
+    def via_email() -> bool:
+        if not customer.email:
+            return False
+        get_channel("email").send(
+            to=customer.email, cc=None,
+            subject=f"Payment link — Invoice {invoice_no}",
+            body=f"Hi {customer.name}, as discussed on the call — here's your payment link for invoice {invoice_no} ({format_inr(amount_rupees)}): {pay_link_url}",
+        )
+        return True
+
+    def via_whatsapp() -> bool:
+        if not customer.phone:
+            return False
+        send_payment_link_to_customer(
+            customer_phone=customer.phone, customer_name=customer.name,
+            invoice_no=invoice_no, amount_rupees=amount_rupees, pay_link_url=pay_link_url,
+        )
+        return True
+
+    # Try the customer's stated preference first, then fall back to
+    # whichever contact detail is actually on file.
+    order = [("email", via_email), ("whatsapp", via_whatsapp)] if preferred_channel == "email" else [("whatsapp", via_whatsapp), ("email", via_email)]
+    for name, send in order:
+        if send():
+            return name
+    return None
+
+
+def escalate_case_to_human(session: Session, customer: Customer, reason: str | None) -> list[Case]:
+    """A customer who explicitly asked to speak to a person during the
+    final voice call — same breadth as flag_dispute (every open case for
+    this customer, since it's the relationship they're asking about, not
+    just one invoice), but a distinct reason so the portal doesn't conflate
+    "wants a human" with "this invoice itself is wrong.\""""
+    open_cases = session.query(Case).filter(Case.customer_id == customer.id, Case.status == "open").all()
+    for case in open_cases:
+        case.status = "paused"
+        case.next_action_at = None
+        record_event(session, case, type="system", payload={"reason": "escalate_to_human", "detail": reason})
+    session.commit()
+    return open_cases
+
+
+def _handle_voice_outcome(session: Session, case: Case, customer: Customer, structured: dict | None) -> None:
+    """CALL-E returns a structured result the instant the call ends — this
+    closes the loop on it immediately rather than waiting for a human to
+    read the transcript later:
+
+    - An explicit request for a human takes priority over everything else —
+      pause for review and stop, don't also try to record a commitment.
+    - A genuine "I can't decide, call me back at 6pm" also pauses for
+      review with that time on record: the terminal voice rung isn't built
+      to place a second automatic call, so a human places the callback
+      rather than the case silently re-exhausting itself unattended.
+    - "paid_now" / "partial" get the real payment link delivered wherever
+      the customer said was easiest (WhatsApp or email) before they've even
+      finished thinking about it. A partial amount is clamped to the
+      invoice balance rather than trusted verbatim — mirroring how
+      over-commitments should always be capped against the real balance.
+    - A committed date (full or the remainder of a partial) becomes a real
+      PromiseToPay, the same mechanism the WhatsApp bot's "promise to pay"
+      message uses.
+    - An explicit refusal pauses the account for human review right away
+      instead of waiting for the case to mechanically exhaust.
+
+    Only ever mints a payment link (a real Razorpay API call) when a
+    payment was actually committed to, not on every call outcome."""
+    if not structured:
+        return
+
+    if structured.get("escalate_to_human"):
+        escalate_case_to_human(session, customer, structured.get("notes"))
+        return
+
+    callback_at = _parse_voice_callback_at(structured.get("callback_requested_at"))
+    if callback_at is not None:
+        case.status = "paused"
+        case.next_action_at = None
+        record_event(session, case, type="system", payload={"reason": "callback_requested", "detail": structured.get("notes"), "callback_at": callback_at.isoformat()})
+        return
+
+    commitment = structured.get("payment_commitment")
+    invoice: Invoice = case.invoice
+    preferred_channel = structured.get("preferred_channel")
+
+    if commitment == "paid_now":
+        link = get_or_create_case_payment_link(session, case)
+        pay_link_url = link["short_url"] if not is_oversized_stub(link["id"]) else None
+        sent_via = _send_payment_link_after_call(customer, invoice.invoice_no, invoice.outstanding, pay_link_url, preferred_channel)
+        record_event(session, case, type="system", payload={"reason": "voice_paid_now", "sent_link_via": sent_via})
+
+    elif commitment == "partial":
+        raw_partial = structured.get("partial_amount_rupees")
+        partial_amount = float(raw_partial) if isinstance(raw_partial, (int, float)) and raw_partial > 0 else None
+
+        if partial_amount is not None:
+            partial_amount = min(partial_amount, invoice.outstanding)  # never a link for more than what's actually owed
+            partial_link = create_payment_link(
+                amount_rupees=partial_amount,
+                invoice_no=invoice.invoice_no,
+                customer_name=customer.name,
+                description=f"Partial payment — Invoice {invoice.invoice_no}",
+                reference_id=f"{invoice.invoice_no}-PARTIAL-{secrets.token_hex(3)}",
+            )
+            pay_link_url = partial_link["short_url"] if not is_oversized_stub(partial_link["id"]) else None
+            sent_via = _send_payment_link_after_call(customer, invoice.invoice_no, partial_amount, pay_link_url, preferred_channel)
+            record_event(session, case, type="system", payload={"reason": "voice_partial_payment", "partial_amount": partial_amount, "sent_link_via": sent_via})
+        else:
+            record_event(session, case, type="system", payload={"reason": "voice_partial_amount_invalid", "raw": raw_partial})
+
+        promised_date = _parse_voice_promised_date(structured.get("promised_date"))
+        if promised_date is not None:
+            record_promise(session, customer, promised_date, source="voice", raw_text=structured.get("notes"))
+
+    elif commitment == "promised_date":
+        promised_date = _parse_voice_promised_date(structured.get("promised_date"))
+        if promised_date is not None:
+            record_promise(session, customer, promised_date, source="voice", raw_text=structured.get("notes"))
+        else:
+            record_event(session, case, type="system", payload={"reason": "voice_promised_date_unparseable", "raw": structured.get("promised_date")})
+
+    elif commitment == "refused":
+        flag_dispute(session, customer, structured.get("notes") or "Customer disputed or refused to pay on the final voice call")
 
 
 def _next_level_index_for_existing_case(case: Case, decision) -> int:
@@ -742,6 +921,10 @@ def send_voice_call_test(session: Session, case: Case, today: dt.date | None = N
     # override — same convention as email dispatch events — so the audit
     # trail always reflects who this escalation was really for.
     record_event(session, case, type="dispatch", channel="voice", payload={"to": to, "status": result.status, "detail": result.detail, "test": True})
+    try:
+        _handle_voice_outcome(session, case, case.customer, result.structured)
+    except Exception:  # noqa: BLE001 — the real call already went through; a bug in the follow-up automation must not read as a failed test
+        logger.exception("post-call automation failed for voice test on case %s (the call itself still went through)", case.id)
     session.commit()
     voice_override = os.getenv("TEST_VOICE_OVERRIDE")
     dialed = voice_override if voice_override and voice_override != to else None

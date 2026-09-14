@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class ChannelResult:
     status: str  # "sent" | "logged" | "failed"
     detail: str
+    structured: dict | None = None  # e.g. CALL-E's payment_commitment result — unused by email/log
 
 
 class Channel:

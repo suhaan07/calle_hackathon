@@ -241,7 +241,7 @@ def test_voice_test_endpoint_calls_and_logs_without_advancing_case(client, sessi
     assert resp.status_code == 200
     data = resp.json()
     assert data["to"] == "+919876512400"
-    assert data["status"] == "logged"  # no real Twilio creds in tests
+    assert data["status"] == "logged"  # no real CALL-E creds in tests
 
     session.refresh(case)
     assert case.playbook_name is None
